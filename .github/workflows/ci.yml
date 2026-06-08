@@ -1,0 +1,231 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test Application
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask requests pytest
+      
+      - name: Run syntax check
+        run: |
+          python -m py_compile app.py
+      
+      - name: Run import test
+        run: |
+          python -c "
+          import sys
+          try:
+              import flask
+              import requests
+              print('✓ All imports successful')
+              print(f'Flask version: {flask.__version__}')
+              print(f'Requests version: {requests.__version__}')
+          except ImportError as e:
+              print(f'✗ Import error: {e}')
+              sys.exit(1)
+          "
+      
+      - name: Start app and test endpoints
+        run: |
+          python app.py &
+          APP_PID=$!
+          sleep 5
+          curl -f http://localhost:5000/version || exit 1
+          curl -f http://localhost:5000/health || exit 1
+          kill $APP_PID
+          echo "✓ All endpoint tests passed!"
+
+  versioning:
+    name: Auto Versioning
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Get latest tag
+        id: get_tag
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v1.0.0")
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest tag: $LATEST_TAG"
+      
+      - name: Calculate next version
+        id: version
+        run: |
+          LATEST_TAG="${{ steps.get_tag.outputs.latest_tag }}"
+          LATEST_TAG=${LATEST_TAG#v}
+          
+          COMMITS=$(git log ${LATEST_TAG}..HEAD --format=%s 2>/dev/null || git log --format=%s)
+          
+          MAJOR=0
+          MINOR=0
+          PATCH=0
+          
+          while IFS= read -r commit; do
+            if [[ "$commit" == *"BREAKING CHANGE"* ]] || [[ "$commit" == *"!"* ]]; then
+              MAJOR=1
+            elif [[ "$commit" == feat* ]]; then
+              MINOR=1
+            elif [[ "$commit" == fix* ]]; then
+              PATCH=1
+            fi
+          done <<< "$COMMITS"
+          
+          IFS='.' read -r major minor patch <<< "$LATEST_TAG"
+          
+          if [ $MAJOR -eq 1 ]; then
+            NEW_VERSION="$((major + 1)).0.0"
+          elif [ $MINOR -eq 1 ]; then
+            NEW_VERSION="$major.$((minor + 1)).0"
+          elif [ $PATCH -eq 1 ]; then
+            NEW_VERSION="$major.$minor.$((patch + 1))"
+          else
+            NEW_VERSION="$major.$minor.$patch"
+          fi
+          
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "Version bump: $LATEST_TAG → $NEW_VERSION"
+      
+      - name: Create version.json
+        run: |
+          cat > version.json << EOF
+          {
+            "version": "${{ steps.version.outputs.new_version }}",
+            "build_date": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "git_commit": "${GITHUB_SHA::7}",
+            "git_tag": "v${{ steps.version.outputs.new_version }}",
+            "branch": "${GITHUB_REF_NAME}",
+            "workflow_run": "${GITHUB_RUN_ID}"
+          }
+          EOF
+          
+          echo "Created version.json:"
+          cat version.json
+      
+      - name: Commit version.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          git commit -m "chore: update version to ${{ steps.version.outputs.new_version }} [skip ci]" || echo "No changes to commit"
+          git push
+      
+      - name: Create Git tag
+        run: |
+          git tag -a "v${{ steps.version.outputs.new_version }}" -m "Release v${{ steps.version.outputs.new_version }}"
+          git push origin "v${{ steps.version.outputs.new_version }}"
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.version.outputs.new_version }}
+          name: Release v${{ steps.version.outputs.new_version }}
+          body: |
+            ## What's Changed
+            
+            Automated release based on conventional commits
+            
+            **Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.get_tag.outputs.latest_tag }}...v${{ steps.version.outputs.new_version }}
+          draft: false
+          prerelease: ${{ github.ref_name != 'main' && github.ref_name != 'master' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-and-deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    needs: versioning
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask requests
+      
+      - name: Verify version.json exists
+        run: |
+          if [ -f version.json ]; then
+            echo "✓ version.json exists"
+            cat version.json
+          else
+            echo "⚠ version.json not found, creating default"
+            cat > version.json << EOF
+            {
+              "version": "${{ needs.versioning.outputs.new_version }}",
+              "build_date": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+              "git_commit": "${GITHUB_SHA::7}"
+            }
+            EOF
+          fi
+      
+      - name: Run final validation
+        run: |
+          python app.py &
+          sleep 5
+          curl -f http://localhost:5000/version || exit 1
+          curl -f http://localhost:5000/health || exit 1
+          echo "✓ Final validation passed!"
+      
+      - name: Deploy to server
+        run: |
+          echo "========================================="
+          echo "Deployment ready for version ${{ needs.versioning.outputs.new_version }}"
+          echo "========================================="
+          echo ""
+          echo "Add your deployment commands here"
+          echo ""
+          echo "Examples:"
+          echo "  - scp -r ./* user@server:/app/"
+          echo "  - ssh user@server 'cd /app && git pull && sudo systemctl restart flask'"
+          echo "  - curl -X POST https://api.render.com/deploy/your-service-id"
+          echo ""
+          echo "✓ CI/CD pipeline completed successfully!"
